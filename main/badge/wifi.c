@@ -1,4 +1,7 @@
 #include "wifi.h"
+#include "esp_timer.h"
+#include "esp_random.h"
+#include "esp_wifi.h"
 
 static const char *TAG = "WIFI";
 static wifi_mode_t curr_mode = WIFI_MODE_NULL;
@@ -11,6 +14,168 @@ const int FAIL_BIT = BIT1;
 static int retry_num = 0;
 static int ap_clients_num = 0;
 static esp_timer_handle_t inactivity_timer;
+
+// WiFi Marauder variables
+static const uint8_t marauder_channels[] = {1, 6, 11}; // Non-overlapping channels
+static char marauder_empty_ssid[32];
+static uint8_t marauder_channel_index = 0;
+static uint8_t marauder_mac_addr[6];
+static uint8_t marauder_wifi_channel = 1;
+static uint32_t marauder_packet_counter = 0;
+static uint32_t marauder_attack_time = 0;
+static uint32_t marauder_packet_rate_time = 0;
+static bool marauder_running = false;
+static TaskHandle_t marauder_task_handle = NULL;
+
+// SSID list for WiFi Marauder (stored in PROGMEM equivalent)
+// Multiple entries with slight variations to ensure WiFi scanners see them as separate networks
+static const char* marauder_ssids[] = {
+    "FREE PALESTINE",
+    "FREE PALESTINE ",
+    " FREE PALESTINE",
+    "FREE PALESTINE  ",
+    "  FREE PALESTINE",
+    "FREE PALESTINE   ",
+    "   FREE PALESTINE",
+    "FREE PALESTINE    ",
+    "    FREE PALESTINE",
+    "FREE PALESTINE     ",
+};
+
+// WiFi Marauder helper functions
+static void marauder_next_channel(void) {
+    if (sizeof(marauder_channels) < 2) {
+        return;
+    }
+    
+    uint8_t ch = marauder_channels[marauder_channel_index];
+    
+    marauder_channel_index++;
+    if (marauder_channel_index >= sizeof(marauder_channels)) {
+        marauder_channel_index = 0;
+    }
+    
+    if (ch != marauder_wifi_channel && ch >= 1 && ch <= 14) {
+        marauder_wifi_channel = ch;
+        esp_wifi_set_channel(marauder_wifi_channel, WIFI_SECOND_CHAN_NONE);
+    }
+}
+
+static void marauder_random_mac(void) {
+    for (int i = 0; i < 6; i++) {
+        marauder_mac_addr[i] = esp_random() % 256;
+    }
+}
+
+// Create a beacon frame dynamically for better control
+static int create_beacon_frame(uint8_t *frame, const uint8_t *mac, const char *ssid, uint8_t channel) {
+    int offset = 0;
+    
+    // Frame Control (0-1)
+    frame[offset++] = 0x80; // Type: Management, Subtype: Beacon
+    frame[offset++] = 0x00; // Flags
+    
+    // Duration (2-3)
+    frame[offset++] = 0x00;
+    frame[offset++] = 0x00;
+    
+    // Destination Address (4-9) - Broadcast
+    frame[offset++] = 0xFF;
+    frame[offset++] = 0xFF;
+    frame[offset++] = 0xFF;
+    frame[offset++] = 0xFF;
+    frame[offset++] = 0xFF;
+    frame[offset++] = 0xFF;
+    
+    // Source Address (10-15)
+    memcpy(&frame[offset], mac, 6);
+    offset += 6;
+    
+    // BSSID (16-21) - Same as source
+    memcpy(&frame[offset], mac, 6);
+    offset += 6;
+    
+    // Sequence Number (22-23)
+    frame[offset++] = 0x00;
+    frame[offset++] = 0x00;
+    
+    // Timestamp (24-31)
+    uint64_t timestamp = esp_timer_get_time() / 1000; // Convert to microseconds
+    for (int i = 0; i < 8; i++) {
+        frame[offset++] = (timestamp >> (i * 8)) & 0xFF;
+    }
+    
+    // Beacon Interval (32-33)
+    frame[offset++] = 0x64; // 100 TU = 100ms
+    frame[offset++] = 0x00;
+    
+    // Capability Information (34-35)
+    frame[offset++] = 0x21; // ESS, Privacy
+    frame[offset++] = 0x00;
+    
+    // SSID Parameter Set (36-37 + SSID)
+    frame[offset++] = 0x00; // SSID parameter tag
+    frame[offset++] = strlen(ssid); // SSID length
+    memcpy(&frame[offset], ssid, strlen(ssid));
+    offset += strlen(ssid);
+    
+    // Supported Rates (38 + rates)
+    frame[offset++] = 0x01; // Supported Rates parameter tag
+    frame[offset++] = 8; // 8 rates
+    frame[offset++] = 0x82; // 1 Mbps
+    frame[offset++] = 0x84; // 2 Mbps
+    frame[offset++] = 0x8b; // 5.5 Mbps
+    frame[offset++] = 0x96; // 11 Mbps
+    frame[offset++] = 0x24; // 18 Mbps
+    frame[offset++] = 0x30; // 24 Mbps
+    frame[offset++] = 0x48; // 36 Mbps
+    frame[offset++] = 0x6c; // 54 Mbps
+    
+    // Current Channel (39-40)
+    frame[offset++] = 0x03; // DS Parameter Set tag
+    frame[offset++] = 0x01; // Length
+    frame[offset++] = channel; // Channel number
+    
+    // RSN Information (WPA2)
+    frame[offset++] = 0x30; // RSN tag
+    frame[offset++] = 0x18; // Length
+    frame[offset++] = 0x01; // Version
+    frame[offset++] = 0x00;
+    frame[offset++] = 0x00; // Group cipher suite
+    frame[offset++] = 0x0f;
+    frame[offset++] = 0xac;
+    frame[offset++] = 0x02;
+    frame[offset++] = 0x02; // Pairwise cipher suite count
+    frame[offset++] = 0x00;
+    frame[offset++] = 0x00; // Pairwise cipher suite 1
+    frame[offset++] = 0x0f;
+    frame[offset++] = 0xac;
+    frame[offset++] = 0x04;
+    frame[offset++] = 0x00; // Pairwise cipher suite 2
+    frame[offset++] = 0x0f;
+    frame[offset++] = 0xac;
+    frame[offset++] = 0x04;
+    frame[offset++] = 0x01; // Authentication suite count
+    frame[offset++] = 0x00;
+    frame[offset++] = 0x00; // Authentication suite
+    frame[offset++] = 0x0f;
+    frame[offset++] = 0xac;
+    frame[offset++] = 0x02;
+    
+    return offset;
+}
+
+static void marauder_init_ssids(void) {
+    // Initialize empty SSID with spaces
+    for (int i = 0; i < 32; i++) {
+        marauder_empty_ssid[i] = ' ';
+    }
+    
+    // Generate random MAC address
+    marauder_random_mac();
+    
+    ESP_LOGI(TAG, "WiFi Marauder initialized with %d SSIDs", MARAUDER_SSID_COUNT);
+}
 
 static void inactivity_timer_callback(void* arg)
 {
@@ -127,98 +292,6 @@ bool start_wifi_ap(void)
 	return ESP_OK;
 }
 
-bool start_wifi_sta()
-{
-	ESP_LOGI(__FILE__, "free_heap_size = %lu\n", esp_get_free_heap_size());
-	
-	const char* STA_WIFI_SSID = badge_obj.sta_ssid;
-	const char* STA_WIFI_PASSWORD = badge_obj.sta_password;
-
-	wifi_config_t wifi_config = { 0 };
-	snprintf((char*)wifi_config.sta.ssid, SIZEOF(wifi_config.sta.ssid), "%s", STA_WIFI_SSID);
-	
-	// Only set password if it's not empty (for open networks)
-	if (strlen(STA_WIFI_PASSWORD) > 0) {
-		snprintf((char*)wifi_config.sta.password, SIZEOF(wifi_config.sta.password), "%s", STA_WIFI_PASSWORD);
-	}
-
-	ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_STA) );
-	ESP_ERROR_CHECK( esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
-    ESP_ERROR_CHECK( esp_wifi_start() );
-	ESP_ERROR_CHECK( esp_wifi_connect() );
-
-	int bits = xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT,
-								   pdFALSE, pdTRUE, STA_TIMEOUT_MS / portTICK_PERIOD_MS);
-	ESP_LOGI(TAG, "bits=%x", bits);
-	if (bits & CONNECTED_BIT) {
-		ESP_LOGI(TAG, "WIFI_MODE_STA connected. SSID:%s password:%s",
-			 STA_WIFI_SSID, STA_WIFI_PASSWORD);
-        schedule_sync_handler(true);
-	} else {
-		ESP_LOGI(TAG, "WIFI_MODE_STA can't connected. SSID:%s password:%s",
-			 STA_WIFI_SSID, STA_WIFI_PASSWORD);
-		stop_wifi();
-	}
-
-    curr_mode = WIFI_MODE_STA;
-	ESP_LOGI(__FILE__, "free_heap_size = %lu\n", esp_get_free_heap_size());
-
-	return (bits & CONNECTED_BIT) != 0;
-}
-
-bool start_wifi_apsta()
-{
-	ESP_LOGI(__FILE__, "free_heap_size = %lu\n", esp_get_free_heap_size());
-	
-	const char* AP_WIFI_SSID = badge_obj.ap_ssid;
-	const char* AP_WIFI_PASSWORD = badge_obj.ap_password;
-	const char* STA_WIFI_SSID = badge_obj.sta_ssid;
-	const char* STA_WIFI_PASSWORD = badge_obj.sta_password;
-
-	wifi_config_t ap_config = { 0 };
-	
-	snprintf((char*)ap_config.ap.ssid, SIZEOF(ap_config.ap.ssid), "%s", AP_WIFI_SSID);
-	snprintf((char*)ap_config.ap.password, SIZEOF(ap_config.ap.password), "%s", AP_WIFI_PASSWORD);
-	ap_config.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
-	ap_config.ap.ssid_len = strlen(AP_WIFI_SSID);
-	ap_config.ap.max_connection = AP_MAX_STA_CONN;
-
-	if (strlen(AP_WIFI_PASSWORD) == 0) {
-		ap_config.ap.authmode = WIFI_AUTH_OPEN;
-	}
-
-	wifi_config_t sta_config = { 0 };
-	snprintf((char*)sta_config.sta.ssid, SIZEOF(sta_config.sta.ssid), "%s", STA_WIFI_SSID);
-	snprintf((char*)sta_config.sta.password, SIZEOF(sta_config.sta.password), "%s", STA_WIFI_PASSWORD);
-
-
-	ESP_ERROR_CHECK( esp_wifi_set_mode(WIFI_MODE_APSTA) );
-	ESP_ERROR_CHECK( esp_wifi_set_config(ESP_IF_WIFI_AP, &ap_config) );
-	ESP_ERROR_CHECK( esp_wifi_set_config(ESP_IF_WIFI_STA, &sta_config) );
-	ESP_ERROR_CHECK( esp_wifi_start() );
-	ESP_LOGI(TAG, "WIFI_MODE_AP started. SSID:%s password:%s",
-			 AP_WIFI_SSID, AP_WIFI_PASSWORD);
-
-	ESP_ERROR_CHECK( esp_wifi_connect() );
-	int bits = xEventGroupWaitBits(wifi_event_group, CONNECTED_BIT,
-								   pdFALSE, pdTRUE, STA_TIMEOUT_MS / portTICK_PERIOD_MS);
-	ESP_LOGI(TAG, "bits=%x", bits);
-	if (bits & CONNECTED_BIT) {
-		ESP_LOGI(TAG, "WIFI_MODE_STA connected. SSID:%s password:%s",
-			 STA_WIFI_SSID, STA_WIFI_PASSWORD);
-        schedule_sync_handler(true);
-	} else {
-		ESP_LOGI(TAG, "WIFI_MODE_STA can't connected. SSID:%s password:%s",
-			 STA_WIFI_SSID, STA_WIFI_PASSWORD);
-		stop_wifi();
-	}
-
-    curr_mode = WIFI_MODE_APSTA;
-	ESP_LOGI(__FILE__, "free_heap_size = %lu\n", esp_get_free_heap_size());
-
-	return (bits & CONNECTED_BIT) != 0;
-}
-
 void stop_wifi(){
 	ESP_LOGI(__FILE__, "free_heap_size = %lu\n", esp_get_free_heap_size());
 
@@ -244,23 +317,205 @@ void wifi_task(void *arg)
                 start_wifi_ap();
 				esp_timer_start_once(inactivity_timer, AP_INACTIVITY_TIMEOUT_S * 1000000);
                 break;
-            case EVENT_STA_START:
+			case EVENT_MARAUDER_START:
                 stop_wifi();
-                start_wifi_sta();
-				retry_num = 0;
-                break;
-            case EVENT_SYNC_START:
-				schedule_sync_handler(true);
+                start_wifi_marauder();
                 break;
             case EVENT_HOTSPOT_STOP:
-            case EVENT_STA_STOP:
                 stop_wifi();
 				esp_timer_stop(inactivity_timer);
-                break;            
+                break;    
+			case EVENT_MARAUDER_STOP:
+				stop_wifi_marauder();
+				break;           
             default:
                 ESP_LOGI(__FILE__, "not exists event 0x%04" PRIx32, wifi_event);
                 break;
         }
         vTaskDelay( 1000 / portTICK_PERIOD_MS );
     }
+}
+
+// WiFi Marauder functions
+bool start_wifi_marauder(void)
+{
+    ESP_LOGI(TAG, "Starting WiFi Marauder...");
+    
+    if (marauder_running) {
+        ESP_LOGW(TAG, "WiFi Marauder already running");
+        return true;
+    }
+    
+    // Stop any existing WiFi
+    stop_wifi();
+    
+    // Initialize WiFi Marauder
+    marauder_init_ssids();
+    
+    // Initialize WiFi with proper configuration for raw packet transmission
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    cfg.nvs_enable = 0; // Disable NVS for this operation
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    
+    // Set WiFi mode to NULL first, then to STA
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_channel(marauder_channels[0], WIFI_SECOND_CHAN_NONE));
+    
+    // Enable promiscuous mode for raw packet transmission
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+    
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    // Wait a bit for WiFi to stabilize
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // Create the marauder task
+    BaseType_t ret = xTaskCreate(
+        wifi_marauder_task,
+        "wifi_marauder",
+        8192, // Increased stack size
+        NULL,
+        5,
+        &marauder_task_handle
+    );
+    
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create WiFi Marauder task");
+        esp_wifi_stop();
+        esp_wifi_deinit();
+        return false;
+    }
+    
+    marauder_running = true;
+    curr_mode = WIFI_MODE_STA;
+    
+    ESP_LOGI(TAG, "WiFi Marauder started successfully");
+    return true;
+}
+
+void stop_wifi_marauder(void)
+{
+    ESP_LOGI(TAG, "Stopping WiFi Marauder...");
+    
+    if (!marauder_running) {
+        ESP_LOGW(TAG, "WiFi Marauder not running");
+        return;
+    }
+    
+    marauder_running = false;
+    
+    // Delete the marauder task
+    if (marauder_task_handle != NULL) {
+        vTaskDelete(marauder_task_handle);
+        marauder_task_handle = NULL;
+    }
+    
+    // Disable promiscuous mode
+    esp_wifi_set_promiscuous(false);
+    
+    // Stop WiFi
+    esp_wifi_stop();
+    esp_wifi_set_mode(WIFI_MODE_NULL);
+    esp_wifi_deinit();
+    
+    curr_mode = WIFI_MODE_NULL;
+    ESP_LOGI(TAG, "WiFi Marauder stopped");
+}
+
+void wifi_marauder_task(void *arg)
+{
+    ESP_LOGI(TAG, "WiFi Marauder task started");
+    
+    // Reset counters
+    marauder_packet_counter = 0;
+    marauder_attack_time = 0;
+    marauder_packet_rate_time = 0;
+    
+    while (marauder_running) {
+        uint32_t current_time = esp_timer_get_time() / 1000; // Convert to milliseconds
+        
+        // Send out SSIDs every 100ms (faster for better AP visibility)
+        if (current_time - marauder_attack_time > 100) {
+            marauder_attack_time = current_time;
+            
+            // Check if WiFi is still running
+            if (curr_mode != WIFI_MODE_STA) {
+                ESP_LOGW(TAG, "WiFi mode changed, stopping marauder task");
+                break;
+            }
+            
+            // Send beacon frames for each SSID on current channel
+            for (int ssid_index = 0; ssid_index < MARAUDER_SSID_COUNT; ssid_index++) {
+                if (!marauder_running) break;
+                
+                const char* ssid = marauder_ssids[ssid_index];
+                if (ssid == NULL) {
+                    ESP_LOGW(TAG, "Invalid SSID at index %d", ssid_index);
+                    continue;
+                }
+                
+                uint8_t ssid_len = strlen(ssid);
+                if (ssid_len > 32) {
+                    ESP_LOGW(TAG, "SSID too long at index %d: %d", ssid_index, ssid_len);
+                    continue;
+                }
+                
+                // Generate completely different MAC address for each SSID
+                // This ensures WiFi scanners see them as different devices
+                uint8_t unique_mac[6];
+                for (int i = 0; i < 6; i++) {
+                    unique_mac[i] = esp_random() % 256;
+                }
+                // Ensure the first bit is 0 (unicast) and second bit is 0 (globally unique)
+                unique_mac[0] &= 0xFC;
+                
+                // Create beacon frame dynamically
+                uint8_t beacon_frame[256]; // Increased buffer size for dynamic frames
+                int frame_len = create_beacon_frame(beacon_frame, unique_mac, ssid, marauder_wifi_channel);
+                
+                // Debug: Log beacon frame details
+                ESP_LOGI(TAG, "Beacon frame: SSID='%s' (len=%d), MAC="MACSTR", Channel=%d, FrameLen=%d", 
+                         ssid, ssid_len, MAC2STR(unique_mac), marauder_wifi_channel, frame_len);
+                
+                // Send packet once per SSID to reduce memory pressure
+                esp_err_t ret = esp_wifi_80211_tx(ESP_IF_WIFI_STA, beacon_frame, frame_len, 0);
+                if (ret == ESP_OK) {
+                    marauder_packet_counter++;
+                    ESP_LOGI(TAG, "Sent beacon for SSID %d: %s with MAC "MACSTR" on channel %d", 
+                             ssid_index, ssid, MAC2STR(unique_mac), marauder_wifi_channel);
+                } else {
+                    ESP_LOGW(TAG, "Failed to send beacon packet: %s", esp_err_to_name(ret));
+                    // If we get memory errors, wait a bit longer
+                    if (ret == ESP_ERR_NO_MEM) {
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                    }
+                }
+                
+                // Very small delay between SSIDs to make them appear simultaneously
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+            
+            // Change channel every 2 seconds (slower channel switching for better AP detection)
+            static uint32_t last_channel_change = 0;
+            if (current_time - last_channel_change > 2000) {
+                marauder_next_channel();
+                last_channel_change = current_time;
+                ESP_LOGI(TAG, "WiFi Marauder switched to channel %d", marauder_wifi_channel);
+            }
+        }
+        
+        // Show packet rate every 5 seconds
+        if (current_time - marauder_packet_rate_time > MARAUDER_PACKET_RATE_INTERVAL_MS) {
+            marauder_packet_rate_time = current_time;
+            
+            ESP_LOGI(TAG, "WiFi Marauder: %lu packets sent", marauder_packet_counter);
+            marauder_packet_counter = 0;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(20)); // Reduced delay for more responsive AP announcements
+    }
+    
+    ESP_LOGI(TAG, "WiFi Marauder task ended");
+    vTaskDelete(NULL);
 }

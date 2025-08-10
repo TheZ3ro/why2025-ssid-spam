@@ -16,11 +16,20 @@
 #define STA_TIMEOUT_MS 20000
 #define STA_MAXIMUM_RETRY 5
 
+// WiFi Marauder defines
+#define MARAUDER_SSID_COUNT 10
+#define MARAUDER_CHANNEL_COUNT 3
+#define MARAUDER_BEACON_INTERVAL_MS 100
+#define MARAUDER_PACKET_RATE_INTERVAL_MS 5000
+
 void wifi_init(void);
 
 bool start_wifi_ap(void);
-bool start_wifi_sta(void);
-bool start_wifi_apsta(void);
+
+// WiFi Marauder functions
+bool start_wifi_marauder(void);
+void stop_wifi_marauder(void);
+void wifi_marauder_task(void *arg);
 
 void stop_wifi(void);
 

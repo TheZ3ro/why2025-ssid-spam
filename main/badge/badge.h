@@ -71,10 +71,8 @@ typedef struct {
 enum enum_badge_event {
     EVENT_HOTSPOT_START, 
     EVENT_HOTSPOT_STOP, 
-    EVENT_STA_START,
-    EVENT_STA_STOP,
-    EVENT_SYNC_START, 
-    EVENT_SYNC_STOP
+    EVENT_MARAUDER_START, 
+    EVENT_MARAUDER_STOP, 
 };
 
 extern QueueHandle_t wifi_queue;

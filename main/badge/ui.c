@@ -1,21 +1,17 @@
 #include "ui.h"
 #include "led.h"
 
-enum screen_order {SCREEN_LOGO, SCREEN_EVENT, SCREEN_RADAR, SCREEN_RSSI,  SCREEN_ADMIN, SCREEN_SNAKE, NUM_SCREENS};
+enum screen_order {SCREEN_LOGO, SCREEN_ADMIN, NUM_SCREENS};
 static lv_obj_t* screens[NUM_SCREENS];
 static int8_t current_screen = SCREEN_LOGO;
 
 static uint32_t last_trigger = -1;
 
-static lv_obj_t *radar_node[MAX_NEARBY_NODE] = {0};
-static lv_obj_t *radar_node_number[MAX_NEARBY_NODE] = {0};
-static lv_obj_t *table_rssi, *table_event;
 static lv_obj_t *admin_switch, *admin_switch_sta, *admin_sync;
 static lv_obj_t *admin_switch_text, *admin_switch_sta_text, *admin_sync_text;
 static lv_obj_t *admin_ssid, *admin_pass;
 static lv_obj_t *admin_client_ip, *admin_gateway_ip;
 
-static bool ap_started = false;
 static bool sta_connected = false;
 
 static uint8_t admin_state = ADMIN_STATE_OFF;
@@ -27,24 +23,6 @@ static int8_t counter_screen = -1; // Initialize to invalid screen index
 // Forward declarations
 void ui_update_ip_info(void);
 void ui_list_all_netifs(void);
-
-void restore_current_task(){
-    if(current_screen == SCREEN_RSSI){
-        lv_task_set_prio(rssi_task_handle, LV_TASK_PRIO_LOW);
-    }
-    else if(current_screen == SCREEN_RADAR){
-        lv_task_set_prio(radar_task_handle, LV_TASK_PRIO_LOW);
-    }
-}
-
-void pause_current_task(){
-    if(current_screen == SCREEN_RSSI){
-        lv_task_set_prio(rssi_task_handle, LV_TASK_PRIO_OFF);
-    }
-    else if(current_screen == SCREEN_RADAR){
-        lv_task_set_prio(radar_task_handle, LV_TASK_PRIO_OFF);
-    }
-}
 
 /*
 * Update the screen backlight status
@@ -59,14 +37,11 @@ static bool ui_update_backlight(bool trigger)
     {
         set_screen_led_backlight(badge_obj.brightness_max);
         last_trigger = lv_tick_get();
-
-        restore_current_task();
     }
     else
     {
         if (span > BRIGHT_OFF_TIMEOUT_MS){
             set_screen_led_backlight(badge_obj.brightness_off);
-            pause_current_task();
         }
         else if (span > BRIGHT_MID_TIMEOUT_MS){
             set_screen_led_backlight(badge_obj.brightness_mid);
@@ -131,10 +106,6 @@ void ui_button_up()
     }
 
     switch(current_screen){
-        case SCREEN_SNAKE:
-            lv_task_set_prio(snake_task_handle, LV_TASK_PRIO_LOW);
-            snake_set_dir(1);
-            break;
         case SCREEN_ADMIN:
             switch(admin_state){
                 case ADMIN_STATE_OFF: // AP and STA disabled: enable AP
@@ -145,20 +116,14 @@ void ui_button_up()
                 case ADMIN_STATE_AP: // AP enabled: disable AP
                     ui_send_wifi_event(EVENT_HOTSPOT_STOP);
                     lv_obj_set_hidden(admin_switch_sta, false);
-                    lv_obj_set_hidden(admin_ssid, true);
                     admin_state = ADMIN_STATE_OFF;
                     break;
-                case ADMIN_STATE_STA: // STA connected: manual IP refresh
-                    ESP_LOGI("UI", "Manual IP refresh triggered via UP button");
-                    ui_manual_ip_update();
-                    // Also test forcing labels to be visible for debugging
-                    ui_force_show_ip_labels();
+                case ADMIN_STATE_MARAUDER: // Marauder enabled: disable Marauder
+                    ui_send_wifi_event(EVENT_MARAUDER_STOP);
+                    lv_obj_set_hidden(admin_switch_sta, false);
+                    admin_state = ADMIN_STATE_OFF;
                     break;
             }   
-            break;
-        case SCREEN_EVENT:
-        case SCREEN_RSSI:
-            scroll_up(screens[current_screen]);
             break;
         default:
             ESP_LOGI(__FILE__, "Button up, no actions");
@@ -197,240 +162,30 @@ void ui_button_down()
     }
 
     switch(current_screen){
-        case SCREEN_SNAKE:
-            lv_task_set_prio(snake_task_handle, LV_TASK_PRIO_LOW);
-            snake_set_dir(-1);
-            break;
         case SCREEN_ADMIN:
             switch(admin_state){
                 case ADMIN_STATE_OFF: // AP and STA disabled: enable STA
-                    ui_send_wifi_event(EVENT_STA_START);
+                    ui_send_wifi_event(EVENT_MARAUDER_START);
                     lv_label_set_text(admin_switch_sta_text, "Started...");
-                    admin_state = ADMIN_STATE_STA;
+                    admin_state = ADMIN_STATE_MARAUDER;
                     break;
                 case ADMIN_STATE_AP: // AP enabled: test showing IP labels
                     ESP_LOGI("UI", "Force show IP labels test (DOWN button in AP mode)");
                     ui_force_show_ip_labels();
                     break;
-                case ADMIN_STATE_STA: // STA mode: test showing IP labels  
-                    ESP_LOGI("UI", "Force show IP labels test (DOWN button in STA mode)");
+                case ADMIN_STATE_MARAUDER: // Marauder enabled: test showing IP labels
+                    ESP_LOGI("UI", "Force show IP labels test (DOWN button in Marauder mode)");
                     ui_force_show_ip_labels();
                     break;
             }
-            break;
-        case SCREEN_EVENT:
-        case SCREEN_RSSI:
-            scroll_down(screens[current_screen]);
             break;
         default:
             ESP_LOGI(__FILE__, "Button down, no actions");
     }
 }
 
-void ui_event_load()
-{
-    const char* buf = load_schedule_from_file();
-    if (buf == NULL)
-    {
-        ESP_LOGI(__FILE__, "Failed to load schedule from file");
-        return;
-    }
-    cJSON* schedule_json = cJSON_Parse(buf);
-    free((char*)buf);
-
-    cJSON* schedule_array = cJSON_GetObjectItem(schedule_json, "schedule");
-
-    int size = cJSON_GetArraySize(schedule_array);
-    lv_table_set_row_cnt(table_event, size);
-    //lv_table_set_col_cnt(table_event, 2);
-
-    char buff[256];
-    for (int i = 0; i < size; i++)
-    {
-        cJSON* item = cJSON_GetArrayItem(schedule_array, i);
-
-        //cJSON *index = cJSON_GetObjectItem(item, "index");
-        cJSON *title = cJSON_GetObjectItem(item, "title");
-        cJSON *day = cJSON_GetObjectItem(item, "day");
-        cJSON *hour = cJSON_GetObjectItem(item, "hour");
-        cJSON *speaker = cJSON_GetObjectItem(item, "speaker");
-        cJSON *location = cJSON_GetObjectItem(item, "location");
-        cJSON *duration = cJSON_GetObjectItem(item, "duration");
-
-        //ESP_LOGI(__FILE__, "Index %d: %s", i, speaker->valuestring);
-
-        if (day && strlen(day->valuestring) > 0) {
-            snprintf(buff, sizeof(buff), "Day: %s\n", day->valuestring);
-        }
-        if (hour && strlen(hour->valuestring) > 0) {
-            snprintf(buff + strlen(buff), sizeof(buff) - strlen(buff), "Time: %s\n", hour->valuestring);
-        }
-        if (location && strlen(location->valuestring) > 0) {
-            snprintf(buff + strlen(buff), sizeof(buff) - strlen(buff), "Where: %s\n", location->valuestring);
-        }
-        if (duration && strlen(duration->valuestring) > 0) {
-            snprintf(buff + strlen(buff), sizeof(buff) - strlen(buff), "How long: %s", duration->valuestring);
-        }
-        
-        lv_table_set_cell_value(table_event, i, 0, buff);
-
-        snprintf(buff, sizeof(buff), "%s\nby %s",
-            title->valuestring, speaker->valuestring);
-        lv_table_set_cell_value(table_event, i, 1, buff);
-    }
-
-    cJSON_Delete(schedule_json);
-}
-
-static void ui_rssi_task(lv_task_t *arg)
-{
-    if (lv_scr_act() != screen_rssi)
-    {
-        lv_task_set_prio(rssi_task_handle, LV_TASK_PRIO_OFF);
-        return;
-    }
-    
-    const uint8_t count = count_ble_nodes();
-    lv_table_set_row_cnt(table_rssi, count+1);
-
-    char buf[BADGE_BUF_SIZE] = {0};
-
-    uint8_t pos = 1;
-
-    for (int i = 0; i < MAX_NEARBY_NODE; i++) {
-        if(!ble_nodes[i].active) continue;
-        
-        lv_table_set_cell_value(table_rssi, pos, 0, ble_nodes[i].name);
-        lv_table_set_cell_align(table_rssi, pos, 0, LV_LABEL_ALIGN_CENTER);
-
-        snprintf(buf, sizeof(buf), "%d dBm", ble_nodes[i].rssi);
-        lv_table_set_cell_value(table_rssi, pos, 1, buf);
-        lv_table_set_cell_align(table_rssi, pos, 1, LV_LABEL_ALIGN_CENTER);
-
-        snprintf(buf, sizeof(buf), "0x0%d", ble_nodes[i].id);
-        lv_table_set_cell_value(table_rssi, pos, 2, buf);
-        lv_table_set_cell_align(table_rssi, pos, 2, LV_LABEL_ALIGN_CENTER);
-
-        pos++;
-    }
-}
-
 static void ui_backlight_task(lv_task_t *arg){
     ui_update_backlight(false);
-}
-
-static void ui_radar_task(lv_task_t *arg)
-{
-
-    if (lv_scr_act() != screen_radar)
-    {
-        lv_task_set_prio(radar_task_handle, LV_TASK_PRIO_OFF);
-        return;
-    }
-
-    if (lv_scr_act() == screen_radar)
-    {
-        static int mode;
-        if (mode)
-        {
-            for (int i = 0; i < MAX_NEARBY_NODE; i++)
-            {
-                if(ble_nodes[i].active) {
-                    lv_coord_t x = rand() % 80, y = rand() % 60;
-
-                    if (ble_nodes[i].rssi > -70)
-                    {
-                        // near range.
-                        if (x < 50)
-                            x = (LV_HOR_RES - x) / 2 - 20;
-                        else
-                            x = (LV_HOR_RES + x) / 2 - 20;
-                        if (y < 40)
-                            y = (LV_VER_RES - y) / 2 - 20;
-                        else
-                            y = (LV_VER_RES + y) / 2 - 20;
-                    }
-                    else if (ble_nodes[i].rssi > -90)
-                    {
-                        // middle range.
-                        if (x < 50)
-                            x = (LV_HOR_RES - 100 - x) / 2;
-                        else
-                            x = (LV_HOR_RES + 100 + x) / 2 - 20;
-                        if (y < 40)
-                            y = (LV_VER_RES - 80 - y) / 2;
-                        else
-                            y = (LV_VER_RES + 80 - y) / 2 - 20;
-                    }
-                    else
-                    {
-                        // long range
-                        if (x < 50)
-                            x = (LV_HOR_RES - 200 - x) / 2;
-                        else
-                            x = (LV_HOR_RES + 200 + x) / 2 - 20;
-                        if (y < 40)
-                            y = (LV_VER_RES - 160 - y) / 2;
-                        else
-                            y = (LV_VER_RES + 160 + y) / 2 - 20;
-                    }
-
-                    lv_obj_set_pos(radar_node[i], x, y);
-                    lv_label_set_text_fmt(radar_node_number[i], "%d", ble_nodes[i].id);
-                    lv_obj_set_hidden(radar_node[i], false);
-                    lv_obj_fade_in(radar_node[i], 1000, 0);
-                } else {
-                    lv_obj_set_hidden(radar_node[i], true);
-                }
-            }
-        }
-        else
-        {
-            for (int i = 0; i < MAX_NEARBY_NODE; i++)
-            {
-                if (lv_obj_is_visible(radar_node[i]))
-                    lv_obj_fade_out(radar_node[i], 1000, 0);
-            }
-        }
-
-        mode = !mode;
-    }
-}
-
-void ui_screen_event_init() {
-    // page for event
-    static lv_style_t style;
-    lv_style_init(&style);
-
-    screen_event = lv_obj_create(NULL, NULL);
-    lv_obj_t *screen_event_page = lv_page_create(screen_event, NULL);
-
-    lv_obj_t *scrollable = lv_page_get_scrollable(screen_event_page);
-    lv_cont_set_layout(scrollable, LV_LAYOUT_PRETTY_TOP);
-    lv_obj_set_style_local_pad_all(scrollable, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 0);
-	lv_obj_set_style_local_pad_inner(scrollable, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 0);
-    lv_obj_set_style_local_pad_all(screen_event_page, LV_PAGE_PART_BG, LV_STATE_DEFAULT, 0);
-    lv_obj_set_style_local_pad_inner(screen_event_page, LV_PAGE_PART_BG, LV_STATE_DEFAULT, 0);
-    lv_page_set_scrollbar_mode(screen_event_page, LV_SCROLLBAR_MODE_OFF);
-
-    lv_obj_set_size(screen_event_page, LV_HOR_RES, LV_VER_RES);
-    lv_coord_t content_w = lv_obj_get_width_grid(screen_event_page, 2, 1);
-
-    lv_style_set_text_font(&style, LV_OBJ_PART_MAIN, &lv_font_montserrat_14);
-
-    table_event = lv_table_create(screen_event_page, NULL);
-    lv_obj_clean_style_list(table_event, LV_TABLE_PART_BG);
-    lv_obj_set_drag_parent(table_event, true);
-    lv_table_set_col_cnt(table_event, 2);
-    lv_table_set_col_width(table_event, 0, 4*(2 * content_w)/10);
-    lv_table_set_col_width(table_event, 1, 6*(2 * content_w)/10);
-    lv_obj_add_style(table_event, LV_OBJ_PART_MAIN, &style);
-
-    lv_obj_align(table_event, screen_event_page, LV_ALIGN_OUT_TOP_LEFT, 0, 0);
-
-    ui_event_load(); 
-
-    screens[SCREEN_EVENT] = screen_event;
 }
 
 void ui_screen_splash_init(){
@@ -450,71 +205,6 @@ void ui_screen_splash_init(){
     screens[SCREEN_LOGO] = screen_logo;
 }
 
-void ui_screen_radar_init(){
-    // Page for radar
-    LV_IMG_DECLARE(img_radar);
-    
-    screen_radar = lv_obj_create(NULL, NULL);
-    lv_obj_t *img = lv_img_create(screen_radar, NULL);
-    lv_img_set_src(img, &img_radar);
-    lv_obj_align(img, NULL, LV_ALIGN_IN_TOP_LEFT, 0, 0);
-
-    for (int i = 0; i < sizeof(radar_node) / sizeof(lv_obj_t *); i++)
-    {
-        radar_node[i] = lv_btn_create(img, NULL);
-        lv_obj_set_size(radar_node[i], 20, 20);
-        lv_btn_toggle(radar_node[i]); // set to solid color.
-        lv_obj_set_hidden(radar_node[i], true);
-        radar_node_number[i] = lv_label_create(radar_node[i], NULL);
-        lv_label_set_text(radar_node_number[i], "X");
-    }
-
-    screens[SCREEN_RADAR] = screen_radar;
-}
-
-void ui_screen_rssi_init(){
-    // page for rssi
-    static lv_style_t style;
-    lv_style_init(&style);
-
-    screen_rssi = lv_obj_create(NULL, NULL);
-    lv_obj_t *screen_rssi_page = lv_page_create(screen_rssi, NULL);
-
-    lv_obj_t *scrollable = lv_page_get_scrollable(screen_rssi_page);
-    lv_cont_set_layout(scrollable, LV_LAYOUT_PRETTY_TOP);
-    lv_obj_set_style_local_pad_all(scrollable, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 0);
-	lv_obj_set_style_local_pad_inner(scrollable, LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, 0);
-    lv_obj_set_style_local_pad_all(screen_rssi_page, LV_PAGE_PART_BG, LV_STATE_DEFAULT, 0);
-    lv_obj_set_style_local_pad_inner(screen_rssi_page, LV_PAGE_PART_BG, LV_STATE_DEFAULT, 0);
-    lv_page_set_scrollbar_mode(screen_rssi_page, LV_SCROLLBAR_MODE_OFF);
-
-    lv_obj_set_size(screen_rssi_page, LV_HOR_RES, LV_VER_RES);
-    lv_coord_t content_w = lv_obj_get_width_grid(screen_rssi_page, 3, 1);
-
-    lv_style_set_text_font(&style, LV_OBJ_PART_MAIN, &lv_font_montserrat_14);
-
-    table_rssi = lv_table_create(screen_rssi_page, NULL);
-    lv_obj_clean_style_list(table_rssi, LV_TABLE_PART_BG);
-    lv_obj_set_drag_parent(table_rssi, true);
-    lv_table_set_col_cnt(table_rssi, 3);
-    lv_table_set_col_width(table_rssi, 0, content_w);
-    lv_table_set_col_width(table_rssi, 1, content_w);
-    lv_table_set_col_width(table_rssi, 2, content_w);
-    lv_obj_add_style(table_rssi, LV_OBJ_PART_MAIN, &style);
-
-    lv_obj_align(table_rssi, screen_rssi_page, LV_ALIGN_OUT_TOP_LEFT, 0, 0);
-
-    lv_table_set_cell_value(table_rssi, 0, 0, "NAME");
-    lv_table_set_cell_value(table_rssi, 0, 1, "RSSI");
-    lv_table_set_cell_value(table_rssi, 0, 2, "ID");
-
-    lv_table_set_cell_align(table_rssi, 0, 0, LV_LABEL_ALIGN_CENTER);
-    lv_table_set_cell_align(table_rssi, 0, 1, LV_LABEL_ALIGN_CENTER);
-    lv_table_set_cell_align(table_rssi, 0, 2, LV_LABEL_ALIGN_CENTER);
-
-    screens[SCREEN_RSSI] = screen_rssi;
-}
-
 void ui_screen_admin_init(){
     // page for admin
     screen_admin = lv_obj_create(NULL, NULL);
@@ -528,7 +218,7 @@ void ui_screen_admin_init(){
     lv_obj_set_size(admin_sync, 200, 50);
     lv_obj_set_pos(admin_sync, 60, 180);
     admin_sync_text = lv_label_create(admin_sync, NULL);
-    lv_label_set_text(admin_sync_text, "FORCE SCHEDULE SYNC");
+    lv_label_set_text(admin_sync_text, "WIFI MARAUDER");
     lv_obj_set_hidden(admin_sync, true);
 
     admin_ssid = lv_label_create(screen_admin, NULL);
@@ -551,56 +241,9 @@ void ui_screen_admin_init(){
     lv_obj_set_size(admin_switch_sta, 200, 50);
     lv_obj_set_pos(admin_switch_sta, 60, 180);
     admin_switch_sta_text = lv_label_create(admin_switch_sta, NULL);
-    lv_label_set_text(admin_switch_sta_text, "SYNC SCHEDULE");
+    lv_label_set_text(admin_switch_sta_text, "WIFI MARAUDER");
 
     screens[SCREEN_ADMIN] = screen_admin;
-}
-
-void ui_screen_snake_init(){
-    // page for snake
-    screen_snake = lv_obj_create(NULL, NULL);
-    snake_reset(screen_snake);
-
-    screens[SCREEN_SNAKE] = screen_snake;
-}
-
-void ui_ap_start_handler() {
-    ap_started = true;
-
-    ESP_LOGI("UI", "AP started handler called");
-    lv_label_set_text(admin_switch_text, "TURN OFF AP");
-
-    char buf[BADGE_BUF_SIZE + 19] = {0};
-    snprintf(buf, sizeof(buf), "SSID: %s", badge_obj.ap_ssid);
-    lv_label_set_text(admin_ssid, buf);
-    snprintf(buf, sizeof(buf), "PASS: %s", badge_obj.ap_password);
-    lv_label_set_text(admin_pass, buf);
-
-    lv_obj_set_hidden(admin_ssid, false);
-    lv_obj_set_hidden(admin_pass, false);
-
-    // Update IP information immediately
-    ui_update_ip_info();
-    
-    // TODO: Also create a delayed task to retry getting IP info
-    // xTaskCreate(ui_delayed_ip_update_task, "delayed_ip_update", 2048, NULL, 5, NULL);
-
-    lv_btn_set_state(admin_switch, LV_BTN_STATE_CHECKED_PRESSED);
-    admin_state = ADMIN_STATE_AP;
-}
-
-void ui_ap_stop_handler(){
-    ap_started = false;
-
-    lv_label_set_text(admin_switch_text, "TURN ON AP");
-    lv_obj_set_hidden(admin_ssid, true);
-    lv_obj_set_hidden(admin_pass, true);
-    lv_obj_set_hidden(admin_client_ip, true);
-    lv_obj_set_hidden(admin_gateway_ip, true);
-    lv_obj_set_hidden(admin_switch_sta, false);
-
-    lv_btn_set_state(admin_switch, LV_BTN_STATE_RELEASED);//enabl(admin_switch);
-    admin_state = ADMIN_STATE_OFF;
 }
 
 void ui_sta_connected_handler(){
@@ -634,7 +277,7 @@ void ui_sta_disconnected_handler(){
 
 void ui_sta_stop_handler() {
     sta_connected = false;
-    lv_label_set_text(admin_switch_sta_text, "SYNC SCHEDULE");
+    lv_label_set_text(admin_switch_sta_text, "WIFI MARAUDER");
     lv_obj_set_hidden(admin_client_ip, true);
     lv_obj_set_hidden(admin_gateway_ip, true);
     admin_state = ADMIN_STATE_OFF;
@@ -654,50 +297,19 @@ void ui_connection_progress(uint8_t cur, uint8_t max){
 
 void ui_toggle_sync(){
     lv_btn_set_state(admin_sync, LV_BTN_STATE_RELEASED);
-    ui_send_wifi_event(EVENT_STA_STOP);
+    ui_send_wifi_event(EVENT_MARAUDER_STOP);
 }
 
 void ui_update_ip_info() {
     char buf[BADGE_BUF_SIZE + 30] = {0};
     
     ESP_LOGI("UI", "=== IP INFO DEBUG ===");
-    ESP_LOGI("UI", "sta_connected: %s, ap_started: %s, admin_state: %d", 
+    ESP_LOGI("UI", "sta_connected: %s, admin_state: %d", 
              sta_connected ? "true" : "false", 
-             ap_started ? "true" : "false", 
              admin_state);
     
     // First, list all network interfaces for debugging
     ui_list_all_netifs();
-    
-    // Get AP interface and show AP IP when AP is started
-    if (ap_started) {
-        esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-        ESP_LOGI("UI", "AP netif handle (WIFI_AP_DEF): %p", ap_netif);
-        
-        if (ap_netif) {
-            esp_netif_ip_info_t ip_info;
-            esp_err_t ret = esp_netif_get_ip_info(ap_netif, &ip_info);
-            ESP_LOGI("UI", "AP esp_netif_get_ip_info returned: %s", esp_err_to_name(ret));
-            ESP_LOGI("UI", "AP IP: " IPSTR, IP2STR(&ip_info.ip));
-            ESP_LOGI("UI", "AP Gateway: " IPSTR, IP2STR(&ip_info.gw));
-            ESP_LOGI("UI", "AP Netmask: " IPSTR, IP2STR(&ip_info.netmask));
-            
-            if (ret == ESP_OK && ip_info.ip.addr != 0) {
-                // Show AP IP information
-                snprintf(buf, sizeof(buf), "AP IP: " IPSTR, IP2STR(&ip_info.ip));
-                lv_label_set_text(admin_client_ip, buf);
-                lv_obj_set_hidden(admin_client_ip, false);
-                ESP_LOGI("UI", "Set admin_client_ip text to: %s", buf);
-                
-                snprintf(buf, sizeof(buf), "\nConnect to\nhttp://" IPSTR, IP2STR(&ip_info.gw));
-                lv_label_set_text(admin_gateway_ip, buf);
-                lv_obj_set_hidden(admin_gateway_ip, false);
-                ESP_LOGI("UI", "Set admin_gateway_ip text to: %s", buf);
-                ESP_LOGI("UI", "Successfully displayed AP IP info");
-                return;
-            }
-        }
-    }
     
     // Get STA interface and show STA IP when connected as station
     if (sta_connected) {
@@ -752,17 +364,7 @@ void ui_update_ip_info() {
                      desc ? desc : "unknown", IP2STR(&ip_info.ip));
             
             // Use interface description to determine type instead of IP range heuristic
-            if (desc && strstr(desc, "ap")) {
-                // AP interface
-                snprintf(buf, sizeof(buf), "AP IP: " IPSTR, IP2STR(&ip_info.ip));
-                lv_label_set_text(admin_client_ip, buf);
-                lv_obj_set_hidden(admin_client_ip, false);
-                
-                snprintf(buf, sizeof(buf), "\nConnect to\nhttp://" IPSTR, IP2STR(&ip_info.gw));
-                lv_label_set_text(admin_gateway_ip, buf);
-                lv_obj_set_hidden(admin_gateway_ip, false);
-                ip_found = true;
-            } else if (desc && strstr(desc, "sta")) {
+            if (desc && strstr(desc, "sta")) {
                 // STA interface
                 snprintf(buf, sizeof(buf), "Client IP: " IPSTR, IP2STR(&ip_info.ip));
                 lv_label_set_text(admin_client_ip, buf);
@@ -793,20 +395,8 @@ static void ui_init(void)
 {
     ui_screen_splash_init();
 
-    ui_screen_event_init();
-
-    ui_screen_radar_init();
-    
-    ui_screen_rssi_init();
-
     ui_screen_admin_init();
-
-    ui_screen_snake_init();
     
-    radar_task_handle = lv_task_create(ui_radar_task, 2000, LV_TASK_PRIO_OFF, NULL);
-    rssi_task_handle = lv_task_create(ui_rssi_task, 2000, LV_TASK_PRIO_OFF, NULL);
-    snake_task_handle = lv_task_create(snake_task, 50, LV_TASK_PRIO_OFF, NULL);
-
     // show first page.
     lv_scr_load(screens[current_screen]);
 
@@ -814,8 +404,6 @@ static void ui_init(void)
     ui_update_backlight(true);
     backlight_task_handle = lv_task_create(ui_backlight_task, 1000, LV_TASK_PRIO_LOW, NULL);
 
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, &ui_ap_start_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STOP, &ui_ap_stop_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ui_sta_connected_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &ui_sta_disconnected_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_STOP, &ui_sta_stop_handler, NULL));
@@ -884,8 +472,6 @@ void ui_switch_page_down()
     ESP_LOGI("DISPLAY", "DISPLAY COUNTER: %d/%d", current_screen+1, NUM_SCREENS);
 
     lv_scr_load_anim(screens[current_screen], LV_SCR_LOAD_ANIM_OVER_TOP, 300, 0, false);
-
-    restore_current_task();
 }
 
 void ui_switch_page_up()
@@ -897,8 +483,6 @@ void ui_switch_page_up()
     ESP_LOGI("DISPLAY", "DISPLAY COUNTER: %d/%d", current_screen+1, NUM_SCREENS);
     
     lv_scr_load_anim(screens[current_screen], LV_SCR_LOAD_ANIM_OVER_BOTTOM, 300, 0, false);
-
-    restore_current_task();
 }
 
 void button_task(void *arg)

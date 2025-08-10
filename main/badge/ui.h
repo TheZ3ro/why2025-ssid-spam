@@ -21,7 +21,6 @@
 #define BUTTON_2 0x09 // UP button
 
 #include "badge.h"
-#include "snake.h"
 
 // Brightness constants - now configured via default.json
 // Legacy values: SCREEN_BRIGHT_MAX=96, SCREEN_BRIGHT_MID=32, SCREEN_BRIGHT_OFF=0
@@ -36,23 +35,16 @@
 #define ADMIN_STATE_OFF 0
 #define ADMIN_STATE_AP 1
 #define ADMIN_STATE_STA 2
+#define ADMIN_STATE_MARAUDER 3
 
 lv_obj_t *screen_logo;  // page 0
-lv_obj_t *screen_event; // page 1
-lv_obj_t *screen_radar; // page 2
-lv_obj_t *screen_rssi;  // page 3
-lv_obj_t *screen_snake; // page 4
-lv_obj_t *screen_admin; // page 5
+lv_obj_t *screen_admin; // page 1
 
-lv_task_t* snake_task_handle;
-lv_task_t* radar_task_handle;
-lv_task_t* rssi_task_handle;
 lv_task_t* backlight_task_handle;
 
 void ui_task(void *);
 void button_task(void *arg);
 
-void ui_event_load();
 void ui_update_ip_info();
 void ui_manual_ip_update();
 void ui_force_show_ip_labels();
